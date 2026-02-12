@@ -3,6 +3,7 @@
 ## Docs
 - [https://helved-docs.ansatt.dev.nav.no](https://helved-docs.ansatt.dev.nav.no) Repo: [helved-docs](https://github.com/navikt/helved-docs)
 - [intern doc](https://github.com/navikt/helved-utbetaling/tree/main/dokumentasjon)
+- [Team Audit Logs](TEAM_AUDIT_LOGS.md)
 
 ## Apps
 - [helved-utbetaling](https://github.com/navikt/helved-utbetaling)
