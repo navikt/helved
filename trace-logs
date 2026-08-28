@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# trace-logs — show all logs for a trace ID across services with span durations
+# Usage: trace-logs <trace_id> [--since <duration>] [--disable-tempo]
+
+LOKI_ADDR="https://loki.nav.cloud.nais.io"
+ORG_ID="tenant"
+TEMPO_ORG_ID="helved"
+
+# Colors
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+usage() {
+    echo "Usage: trace-logs <trace_id> [--since <duration>] [--limit <n>] [--disable-tempo]"
+    echo ""
+    echo "  --since          How far back to search (default: 1h)"
+    echo "  --limit          Max log lines (default: 200)"
+    echo "  --disable-tempo  Skip Tempo span duration lookup"
+    echo ""
+    echo "Example: trace-logs d25a19c1e13198218820f2b9e13ab94e --since 6h"
+    exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+
+TRACE_ID="$1"
+shift
+
+SINCE="1h"
+LIMIT=200
+TEMPO_ENABLED=true
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --since) SINCE="$2"; shift 2 ;;
+        --limit) LIMIT="$2"; shift 2 ;;
+        --disable-tempo) TEMPO_ENABLED=false; shift ;;
+        *) echo "Unknown flag: $1"; usage ;;
+    esac
+done
+
+TOKEN=$(gcloud auth print-access-token 2>/dev/null) || {
+    echo "Error: gcloud auth failed. Run 'gcloud auth login' first."
+    exit 1
+}
+
+echo "Querying logs for trace_id=${TRACE_ID} (since: ${SINCE})..."
+
+RESULTS=$(logcli query \
+    "{service_namespace=~\".+\", service_name!=\"nais-ingress\"} |= \"${TRACE_ID}\"" \
+    --addr="$LOKI_ADDR" \
+    --org-id="$ORG_ID" \
+    --bearer-token="$TOKEN" \
+    --since="$SINCE" \
+    --limit="$LIMIT" \
+    --output=jsonl \
+    --include-label=service_name \
+    --include-label=service_namespace \
+    --include-label=k8s_cluster_name \
+    --quiet 2>/dev/null || true)
+
+if [[ -z "$RESULTS" ]]; then
+    echo "No logs found. Try wider --since range."
+    exit 0
+fi
+
+# Determine Tempo URL from cluster label
+cluster_to_tempo_url() {
+    case "$1" in
+        prod|prod-fss) echo "https://tempo.prod-gcp.nav.cloud.nais.io" ;;
+        dev|dev-fss)   echo "https://tempo.dev-gcp.nav.cloud.nais.io" ;;
+        *)             echo "https://tempo.prod-gcp.nav.cloud.nais.io" ;;
+    esac
+}
+
+# Build span lookup files from Tempo
+SPAN_MAP_FILE=$(mktemp)
+CHILD_MAP_FILE=$(mktemp)
+trap "rm -f $SPAN_MAP_FILE $CHILD_MAP_FILE" EXIT
+
+if [[ "$TEMPO_ENABLED" == "true" ]]; then
+    CLUSTER=$(echo "$RESULTS" | head -1 | jq -r '.labels.k8s_cluster_name // "prod"')
+    TEMPO_URL=$(cluster_to_tempo_url "$CLUSTER")
+
+    echo "Fetching span durations from Tempo (${CLUSTER})..."
+
+    TRACE_JSON=$(tempo-cli-arm64 query api trace-id \
+        --org-id "$TEMPO_ORG_ID" \
+        --header "Authorization=Bearer $TOKEN" \
+        "$TEMPO_URL" "$TRACE_ID" 2>/dev/null || true)
+
+    if [[ -n "$TRACE_JSON" ]]; then
+        echo "$TRACE_JSON" | jq -r '
+            .resourceSpans[]?.scopeSpans[]?.spans[]? |
+            [.spanId, (.parentSpanId // ""), (.name // ""),
+             ((((.endTimeUnixNano | tonumber) - (.startTimeUnixNano | tonumber)) / 1000000 * 10 | floor) / 10 | tostring)
+            ] | @tsv
+        ' 2>/dev/null > /tmp/trace-logs-raw-spans.tsv || true
+
+        while IFS=$'\t' read -r b64id b64parent name dur; do
+            hex=$(echo -n "$b64id" | base64 -d 2>/dev/null | xxd -p | tr -d '\n')
+            echo "${hex} ${dur}" >> "$SPAN_MAP_FILE"
+            if [[ -n "$b64parent" ]]; then
+                hex_parent=$(echo -n "$b64parent" | base64 -d 2>/dev/null | xxd -p | tr -d '\n')
+                printf '%s\t%s\t%s\t%s\n' "$hex_parent" "$hex" "$dur" "$name" >> "$CHILD_MAP_FILE"
+            fi
+        done < /tmp/trace-logs-raw-spans.tsv
+        rm -f /tmp/trace-logs-raw-spans.tsv
+    fi
+fi
+
+echo ""
+
+colorize_level() {
+    case "$1" in
+        ERROR|FATAL) echo -e "${RED}${1}${NC}" ;;
+        WARN|WARNING) echo -e "${YELLOW}${1}${NC}" ;;
+        INFO) echo -e "${GREEN}${1}${NC}" ;;
+        DEBUG) echo -e "${CYAN}${1}${NC}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# Look up span duration: try child spans first (match by table name in log), fall back to own span
+lookup_span_duration() {
+    local span_id="$1"
+    local log_msg="$2"
+
+    if [[ ! -s "$SPAN_MAP_FILE" || -z "$span_id" ]]; then
+        echo "-"
+        return
+    fi
+
+    # Try to find a child span whose name matches the log message (for DB queries)
+    if [[ -s "$CHILD_MAP_FILE" ]]; then
+        local table=""
+        if echo "$log_msg" | grep -qiE '(SELECT|INSERT|UPDATE|DELETE)' 2>/dev/null; then
+            table=$(echo "$log_msg" | grep -oiE 'FROM\s+\w+|INTO\s+\w+|UPDATE\s+\w+' 2>/dev/null | head -1 | awk '{print $NF}' || true)
+        fi
+
+        if [[ -n "$table" ]]; then
+            local child_dur
+            child_dur=$(grep "^${span_id}" "$CHILD_MAP_FILE" 2>/dev/null | grep -i "$table" 2>/dev/null | head -1 | cut -f3 || true)
+            if [[ -n "$child_dur" ]]; then
+                echo "${child_dur}ms"
+                return
+            fi
+        fi
+    fi
+
+    # Fall back to own span duration
+    local dur
+    dur=$(grep "^${span_id} " "$SPAN_MAP_FILE" 2>/dev/null | head -1 | awk '{print $2}' || true)
+    if [[ -n "$dur" ]]; then
+        echo "${dur}ms"
+        return
+    fi
+
+    echo "-"
+}
+
+# Parse and format
+echo "$RESULTS" | jq -r '
+    .timestamp as $ts |
+    (.labels // {}) as $labels |
+    ((.line // "{}") | fromjson? // {}) as $log |
+    [
+        ($ts | split(".")[0] | sub("T"; " ")),
+        ($labels.service_namespace // "?"),
+        ($labels.service_name // "unknown"),
+        ($labels.k8s_cluster_name // "?"),
+        ($log.level // $log.Level // "?"),
+        ($log.span_id // ""),
+        ($log.message // $log.msg // .line // "?" | gsub("\n"; " ") | if length > 120 then .[:120] + "..." else . end)
+    ] | @tsv
+' | sort | while IFS=$'\t' read -r ts ns svc cluster level span_id msg; do
+    colored_level=$(colorize_level "$level")
+    span_dur=$(lookup_span_duration "$span_id" "$msg")
+    printf "%s | %-10.10s | %-10.10s | %-4.4s | %-5b | %7s | %s\n" "$ts" "$ns" "$svc" "$cluster" "$colored_level" "$span_dur" "$msg"
+done
+
+COUNT=$(echo "$RESULTS" | wc -l | tr -d ' ')
+echo ""
+echo "— ${COUNT} log(s) found —"

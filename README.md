@@ -25,3 +25,12 @@
 - [https://peisen.intern.dev.nav.no](https://peisen.intern.dev.nav.no/)
 - [https://peisen.intern.nav.no](https://peisen.intern.nav.no/)
 - [helved-kafka-cli](https://github.com/navikt/helved-kafka-cli)
+
+### trace-logs
+depends on `gcloud`, `logcli`, `tempo-cli`.
+
+logcli kan installeres fra homebrew,
+
+tempo-cli må muligens bygges selv (https://github.com/grafana/tempo),
+pass på at binary som bygges heter `tempo-cli-arm64` og er tilgjengelig på PATH.
+
